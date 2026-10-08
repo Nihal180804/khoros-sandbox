@@ -42,7 +42,7 @@
 
 ## 🚀 Overview
 
-**Khoros** is a high-performance, container-less sandboxed execution engine engineered specifically for multi-tenant code execution platforms, online judges, and autonomous LLM code interpreter agents.
+**Khoros** is a high-performance, container-less sandboxed execution engine engineered specifically for multi-turn AI CodeAct agent evaluation loops (where standard container latency compounds across iterative debugging steps) and competitive programming judges.
 
 Traditional containerization engines (Docker, Podman, runc) add heavyweight daemon layers, virtual ethernet pairs, and complex initialization routines that inflate cold-start latencies to **300ms – 1000ms+**. MicroVMs (Firecracker, gVisor) reduce startup time but still require virtualization abstractions and 100ms+ boot overhead.
 
@@ -371,6 +371,10 @@ sudo ./sandbox_runner --timeout 3 --mem 128 --cgroup test_run_01 /usr/bin/python
 Khoros uses a minimal Alpine Linux rootfs as its guest jail template. The bootstrap script downloads Alpine minirootfs and pre-installs Python 3, GCC/G++, and Musl headers:
 
 ```bash
+# Using Makefile
+make bootstrap
+
+# Or directly via script
 chmod +x scripts/bootstrap_rootfs.sh
 ./scripts/bootstrap_rootfs.sh
 ```
@@ -379,16 +383,20 @@ chmod +x scripts/bootstrap_rootfs.sh
 
 ### 2. Compile the Sandbox Runner
 
-Compile the C++17 sandboxing binary with `libseccomp` linking and `-O2` optimizations:
+Build the C++17 sandboxing binary using `make` (recommended) or direct `g++`:
 
 ```bash
+# Compile via Makefile (primary)
+make build
+
+# Or compile manually with g++
 g++ -O2 -std=c++17 src/main.cpp -lseccomp -o sandbox_runner
-```
 
-Set up the parent cgroup directory:
-
-```bash
+# Initialize the parent cgroups v2 hierarchy
 sudo mkdir -p /sys/fs/cgroup/sandbox_demo
+
+# Delegate passwordless sudo execution for the runner binary
+echo "$USER ALL=(ALL) NOPASSWD: $(pwd)/sandbox_runner" | sudo tee /etc/sudoers.d/khoros_runner
 ```
 
 ---
@@ -404,6 +412,10 @@ pip install fastapi uvicorn requests
 Launch the high-concurrency API server:
 
 ```bash
+# Using Makefile
+make server
+
+# Or directly via uvicorn
 uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
@@ -414,6 +426,10 @@ uvicorn api.server:app --host 0.0.0.0 --port 8000
 Verify all security policies, watchdog timeouts, and execution sanity:
 
 ```bash
+# Using Makefile
+make test
+
+# Or directly via script
 chmod +x scripts/test_engine.sh
 ./scripts/test_engine.sh
 ```
@@ -440,7 +456,9 @@ khoros-sandbox/
 │   └── test_engine.sh         # End-to-end integration test suite
 ├── src/
 │   └── main.cpp               # Core C++17 isolation engine (cgroups v2, namespaces, seccomp)
+├── Makefile                   # Build automation (build, bootstrap, server, test, clean)
 ├── .gitignore                 # Excludes binaries, build artifacts, and rootfs trees
+├── LICENSE                    # MIT License
 └── README.md                  # Comprehensive engine documentation & benchmarks
 ```
 
