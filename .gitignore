@@ -1,0 +1,19 @@
+# Binaries
+sandbox_runner
+*.o
+
+# Rootfs & jail scratchdirs
+rootfs/
+.old_root/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+env/
+
+# System / IDE
+.vscode/
+.idea/
+*.swp
