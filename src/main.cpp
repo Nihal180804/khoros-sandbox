@@ -2,13 +2,21 @@
 //
 // Isolation model (in order of application):
 //   parent (root) : validate args, resolve rootfs from /proc/self/exe, create cgroup,
-//                   enable controllers, apply memory/pids/cpu limits, arm watchdog
+//                   enable controllers, apply memory/pids/cpu limits, write the
+//                   leaf's userns uid/gid maps, arm watchdog
 //   middle child  : unshare(NET|PID|NS|IPC|UTS|CGROUP), fork leaf (leaf becomes PID 1)
 //   leaf          : read-only rootfs bind, RW workspace bind, private /proc /dev /tmp,
-//                   pivot_root, NO_NEW_PRIVS, securebits, capability bounding set drop,
-//                   setgid/setuid to an unprivileged id, rlimits, seccomp allowlist, execve
+//                   pivot_root (all as real host root), THEN unshare(USER) and have
+//                   the parent write its maps, NO_NEW_PRIVS, securebits, capability
+//                   bounding-set drop, setgid/setuid to an unprivileged id, an
+//                   explicit capset to empty, rlimits, seccomp allowlist, execve
 //
-// The leaf never executes untrusted code with uid 0 or any capability.
+// The user namespace is created AFTER the mounts, not before: a non-initial user
+// namespace cannot bind a subdirectory out of the host's locked root mount, so
+// the jail is built as real root first. The leaf then enters its own user
+// namespace whose inside-uid 0 maps to an unprivileged host uid (and whose host
+// uid 0 is left unmapped), so even a regained in-jail uid 0 is unprivileged on
+// the host. The leaf never executes untrusted code with uid 0 or any capability.
 
 #include <chrono>
 #include <cstring>
@@ -182,6 +190,51 @@ static std::string read_file(const std::string& path) {
     std::ostringstream ss;
     ss << f.rdbuf();
     return ss.str();
+}
+
+// Build one id map for the leaf's user namespace:
+//   0     <nobody>  1   inside-id 0 -> an unprivileged host id. The whole point:
+//                       a regained in-jail uid 0 is unprivileged on the host.
+//   <id>  <id>      1   the sandbox id, identity-mapped, so the leaf's
+//                       setresuid(id) and the host-side workspace chown/cleanup
+//                       are unchanged.
+// Host id 0 is deliberately NOT mapped: the jail's mounts and pivot_root all run
+// as real host root BEFORE the user namespace is created, so the leaf never
+// needs its host-0 fsuid mapped for a mount, and leaving host 0 out of the map
+// means real root is entirely unreachable from inside the namespace. The
+// inside-0 line is dropped when <id> == <nobody> (e.g. the CLI default uid
+// 65534), because two lines sharing a host id is an invalid, overlapping map;
+// inside-0 is then simply unmapped and uid 0 is unreachable, which is at least
+// as safe. Pool ids (>= 100000) always get the full two-line map.
+static std::string build_id_map(unsigned long id, unsigned long nobody) {
+    std::string m;
+    if (id != nobody) m = "0 " + std::to_string(nobody) + " 1\n";
+    m += std::to_string(id) + " " + std::to_string(id) + " 1\n";
+    return m;
+}
+
+// Write the leaf's user-namespace uid/gid maps. Called by the root parent --
+// which holds CAP_SETUID/CAP_SETGID in the initial (parent) user namespace, as
+// required to map ids other than its own -- after the middle child has created
+// the userns and before it acts privileged inside it.
+//
+// We deliberately do NOT write "deny" to .../setgroups. That restriction only
+// applies when gid_map is written by a process lacking CAP_SETGID in the parent
+// namespace (the unprivileged self-map case); a privileged writer may map gids
+// freely with setgroups left enabled. Leaving it enabled is required, because
+// drop_privileges() calls setgroups(0, NULL) to shed root's supplementary
+// groups before dropping to the sandbox id -- "deny" would make that fail.
+//
+// uid_map/gid_map must each be written in a single write(2), which write_file
+// does. Any failure is fatal: the caller must not proceed to run untrusted code
+// without the mapping in place.
+static bool write_userns_maps(pid_t pid, uid_t uid, gid_t gid) {
+    const std::string base = "/proc/" + std::to_string(pid) + "/";
+    if (!write_file(base + "gid_map", build_id_map(gid, DEFAULT_SANDBOX_GID)))
+        return false;
+    if (!write_file(base + "uid_map", build_id_map(uid, DEFAULT_SANDBOX_UID)))
+        return false;
+    return true;
 }
 
 // run_id lands in a filesystem path, so it must not be able to escape it.
@@ -395,6 +448,40 @@ static void rm_contents_at(int dirfd, int depth) {
     closedir(d);                        // closes dirfd
 }
 
+// Recursively hand a subtree to (uid, gid). Used only for the overlay layout,
+// whose lower/upper/work dirs are created by the unprivileged API user but must
+// be readable (lower) and writable (upper/work) by the jailed sandbox uid. The
+// same symlink discipline as rm_contents_at applies: fchownat never follows the
+// final component, and we only descend through an O_NOFOLLOW directory fd, so a
+// symlink planted in the tree cannot redirect a chown onto a host file.
+static void chown_r_at(int dirfd, uid_t uid, gid_t gid, int depth) {
+    DIR* d = fdopendir(dirfd);          // takes ownership of dirfd
+    if (!d) { close(dirfd); return; }
+
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+
+        struct stat st;
+        if (fstatat(dirfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) continue;
+        (void)!fchownat(dirfd, e->d_name, uid, gid, AT_SYMLINK_NOFOLLOW);
+
+        if (S_ISDIR(st.st_mode) && depth < MAX_CLEANUP_DEPTH) {
+            int sub = openat(dirfd, e->d_name,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub >= 0) chown_r_at(sub, uid, gid, depth + 1);
+        }
+    }
+    closedir(d);                        // closes dirfd
+}
+
+static void chown_r(const std::string& path, uid_t uid, gid_t gid) {
+    if (chown(path.c_str(), uid, gid) < 0) { /* best effort on the root */ }
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    chown_r_at(fd, uid, gid, 0);
+}
+
 // Under sudo our real uid is also 0, so the owner to hand the directory back to
 // comes from SUDO_UID/SUDO_GID when present.
 static void caller_ids(uid_t& uid, gid_t& gid) {
@@ -444,7 +531,7 @@ static void mount_or_die(const char* src, const char* tgt, const char* fs,
 
 static void setup_filesystem_jail(const std::string& new_root,
                                   const std::string& workdir_rel,
-                                  int tmp_mb) {
+                                  int tmp_mb, bool do_overlay) {
     // Detach our mount propagation from the host before touching anything.
     mount_or_die(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr,
                  "make / private");
@@ -466,6 +553,32 @@ static void setup_filesystem_jail(const std::string& new_root,
         mount_or_die(nullptr, ws.c_str(), nullptr,
                      MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV, nullptr,
                      "remount workspace rw");
+
+        // Opt-in copy-on-write workspace. The caller lays out lower/ (the ro
+        // source seed), upper/ (writes land here), work/ (overlayfs scratch)
+        // and merged/ (the mountpoint) inside the workspace, which is now a rw
+        // bind, so upper/work are on a writable fs and persist between the
+        // compile and execute processes of a pipeline. merged/ and upper/ are
+        // siblings, so the mountpoint never overlaps upperdir -- overlayfs
+        // rejects that. The jail chdirs into merged/ (handled by the caller).
+        if (do_overlay) {
+            std::string lower  = ws + "/lower";
+            std::string upper  = ws + "/upper";
+            std::string work   = ws + "/work";
+            std::string merged = ws + "/merged";
+            struct stat os;
+            for (const std::string* p : {&lower, &upper, &work, &merged}) {
+                if (stat(p->c_str(), &os) < 0 || !S_ISDIR(os.st_mode)) {
+                    fprintf(stderr, "khoros(jail): overlay layout missing %s\n",
+                            p->c_str());
+                    _exit(126);
+                }
+            }
+            std::string opts = "lowerdir=" + lower +
+                               ",upperdir=" + upper + ",workdir=" + work;
+            mount_or_die("overlay", merged.c_str(), "overlay",
+                         MS_NOSUID | MS_NODEV, opts.c_str(), "mount overlay");
+        }
     }
 
     // put_old must already exist: creating and removing it per run raced between
@@ -489,7 +602,9 @@ static void setup_filesystem_jail(const std::string& new_root,
 
     // Minimal /dev. Alpine's minirootfs ships an empty /dev, so without this
     // anything that opens /dev/null or /dev/urandom fails inside the jail.
-    // MS_NODEV is deliberately absent here and only for this mount.
+    // MS_NODEV is deliberately absent here and only for this mount. This runs
+    // before the user namespace exists (as real root in the initial userns), so
+    // mknod of the device nodes is permitted; a userns would forbid it.
     mount_or_die("tmpfs", "/dev", "tmpfs", MS_NOSUID, "size=1m,mode=755",
                  "mount /dev");
     struct { const char* path; int maj; int min; } nodes[] = {
@@ -538,6 +653,20 @@ static void drop_privileges(uid_t uid, gid_t gid) {
     if (setgroups(0, nullptr) < 0) die_child("setgroups");
     if (setresgid(gid, gid, gid) < 0) die_child("setresgid");
     if (setresuid(uid, uid, uid) < 0) die_child("setresuid");
+
+    // Explicitly empty every capability set. The kernel's setuid fixup normally
+    // clears the effective and permitted sets when a root process drops to a
+    // non-root uid, but that fixup keys on the process being uid 0 in the
+    // INITIAL user namespace. Here the leaf created its own user namespace and
+    // is the namespace's privileged owner with a full capability set, while its
+    // real (host) uid 0 is deliberately left unmapped -- so the fixup does not
+    // fire and the capabilities survive the setresuid. Drop them by hand; with
+    // the bounding set already empty and NO_NEW_PRIVS set, they cannot return.
+    {
+        struct { unsigned v; int pid; } hdr = { 0x20080522u /* _V3 */, 0 };
+        struct { unsigned eff, prm, inh; } data[2] = {{0,0,0},{0,0,0}};
+        if (syscall(SYS_capset, &hdr, data) < 0) die_child("capset (drop caps)");
+    }
 
     // Verify rather than trust: a silently failed drop is the whole ballgame.
     if (getuid() != uid || geteuid() != uid ||
@@ -759,6 +888,15 @@ static std::vector<char*> build_env(std::vector<std::string>& storage,
     storage.push_back("LC_ALL=C.UTF-8");
     storage.push_back("PYTHONDONTWRITEBYTECODE=1");
     storage.push_back("PYTHONUNBUFFERED=1");
+    // Point every toolchain's cache/home at the writable tmpfs so Go, Rust and
+    // Node can build and run hermetically without a writable HOME or network.
+    // Harmless to the other runtimes, which simply ignore them.
+    storage.push_back("GOCACHE=/tmp/.gocache");
+    storage.push_back("GOPATH=/tmp/.go");
+    storage.push_back("GOFLAGS=-mod=mod");
+    storage.push_back("CGO_ENABLED=0");
+    storage.push_back("CARGO_HOME=/tmp/.cargo");
+    storage.push_back("NPM_CONFIG_CACHE=/tmp/.npm");
     if (!workdir_rel.empty()) storage.push_back("PWD=/" + workdir_rel);
 
     std::vector<char*> envp;
@@ -781,6 +919,9 @@ static void usage(const char* argv0) {
         "                     return the empty dir to the calling user. Pass this\n"
         "                     only on the last stage of a multi-stage pipeline,\n"
         "                     otherwise it removes the compiler's output.\n"
+        "  --overlay          mount the workdir as an overlayfs (lower/upper/work/\n"
+        "                     merged must already exist inside it); the jail runs\n"
+        "                     in merged/ with copy-on-write writes landing in upper/\n"
         "  --uid <n>          unprivileged uid to run as (default %u)\n"
         "  --gid <n>          unprivileged gid to run as (default %u)\n"
         "  --seccomp <mode>   enforce | log | off (default enforce)\n",
@@ -821,6 +962,7 @@ int main(int argc, char* argv[]) {
     gid_t       sandbox_gid = DEFAULT_SANDBOX_GID;
     SeccompMode seccomp_mode = SeccompMode::Enforce;
     bool        do_cleanup   = false;
+    bool        do_overlay   = false;
 
     int i = 1;
     for (; i < argc; ) {
@@ -849,6 +991,7 @@ int main(int argc, char* argv[]) {
             i += 2;
         }
         else if (!strcmp(argv[i], "--cleanup")) { do_cleanup = true; i += 1; }
+        else if (!strcmp(argv[i], "--overlay")) { do_overlay = true; i += 1; }
         else if (!strcmp(argv[i], "--help")) usage(argv[0]);
         else break;
     }
@@ -874,6 +1017,10 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "khoros: --workdir must be a safe relative path\n");
         _exit(2);
     }
+    if (do_overlay && workdir_rel.empty()) {
+        fprintf(stderr, "khoros: --overlay requires --workdir\n");
+        _exit(2);
+    }
     if (argv[i][0] != '/') {
         fprintf(stderr, "khoros: command must be an absolute path (got %s)\n", argv[i]);
         _exit(2);
@@ -896,15 +1043,30 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "khoros: workdir %s does not exist\n", host_ws.c_str());
             _exit(2);
         }
-        if (chown(host_ws.c_str(), sandbox_uid, sandbox_gid) < 0) die("chown workdir");
+        // The overlay layout's lower/upper/work/merged subdirs are created by
+        // the unprivileged API user, so hand the whole subtree to the sandbox
+        // uid; the flat workspace only needs its top directory chowned.
+        if (do_overlay) chown_r(host_ws, sandbox_uid, sandbox_gid);
+        else if (chown(host_ws.c_str(), sandbox_uid, sandbox_gid) < 0) die("chown workdir");
         if (chmod(host_ws.c_str(), 0700) < 0) die("chmod workdir");
         g_restore_ws = host_ws;   // every later exit path hands it back
     }
 
-    int stdout_pipe[2], stderr_pipe[2], sync_pipe[2];
-    if (pipe2(stdout_pipe, O_CLOEXEC) < 0 ||
-        pipe2(stderr_pipe, O_CLOEXEC) < 0 ||
-        pipe2(sync_pipe,   O_CLOEXEC) < 0) die("pipe2");
+    // Handshake pipes. The user namespace is created by the leaf only AFTER it
+    // has built the filesystem jail as real host root, because a non-initial
+    // user namespace cannot bind a subdirectory out of the host's locked root
+    // mount. The parent then writes the leaf's maps (it alone holds CAP_SETUID
+    // in the initial userns), so the pid and the map handshake flow as:
+    //   sync_pipe  : parent -> middle child  ("G": cgroup set up, proceed)
+    //   pid_pipe   : middle child -> parent  (the leaf's host-side pid)
+    //   ready_pipe : leaf -> parent          ("R": leaf has created its userns)
+    //   done_pipe  : parent -> leaf          ("M": leaf's uid/gid maps written)
+    int stdout_pipe[2], stderr_pipe[2];
+    int sync_pipe[2], pid_pipe[2], ready_pipe[2], done_pipe[2];
+    if (pipe2(stdout_pipe, O_CLOEXEC) < 0 || pipe2(stderr_pipe, O_CLOEXEC) < 0 ||
+        pipe2(sync_pipe,  O_CLOEXEC) < 0 || pipe2(pid_pipe,   O_CLOEXEC) < 0 ||
+        pipe2(ready_pipe, O_CLOEXEC) < 0 || pipe2(done_pipe,  O_CLOEXEC) < 0)
+        die("pipe2");
 
     auto start_time = std::chrono::steady_clock::now();
 
@@ -914,7 +1076,10 @@ int main(int argc, char* argv[]) {
     if (child_pid == 0) {
         // ---------------- middle child ----------------
         setpgid(0, 0);
-        close(sync_pipe[1]);
+        close(sync_pipe[1]);     // parent writes it
+        close(pid_pipe[0]);      // parent reads it
+        close(ready_pipe[0]);    // parent reads it (the leaf writes [1])
+        close(done_pipe[1]);     // parent writes it (the leaf reads [0])
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
 
@@ -923,13 +1088,15 @@ int main(int argc, char* argv[]) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        // Wait until the parent has placed us in the cgroup. A short read or
-        // EOF means the parent died before confining us, so refuse to run
-        // rather than executing untrusted code without limits.
+        // Wait until the parent has placed us in the cgroup. A short read or EOF
+        // means the parent died before confining us, so refuse to run.
         char go = 0;
         if (read(sync_pipe[0], &go, 1) != 1 || go != 'G') _exit(126);
         close(sync_pipe[0]);
 
+        // Every namespace EXCEPT the user namespace. The leaf builds the jail as
+        // real host root in the initial user namespace (the userns comes later),
+        // which is what makes the rootfs bind and pivot_root succeed.
         if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC |
                     CLONE_NEWUTS | CLONE_NEWCGROUP) < 0) {
             fprintf(stderr, "khoros: unshare failed: %s\n", strerror(errno));
@@ -941,12 +1108,28 @@ int main(int argc, char* argv[]) {
 
         if (leaf == 0) {
             // ---------------- jailed leaf ----------------
-            setup_filesystem_jail(rootfs, workdir_rel, tmp_mb);
+            close(pid_pipe[1]);  // the middle child reports our pid, not us
+
+            setup_filesystem_jail(rootfs, workdir_rel, tmp_mb, do_overlay);
 
             if (!workdir_rel.empty()) {
                 std::string in_jail = "/" + workdir_rel;
+                if (do_overlay) in_jail += "/merged";
                 if (chdir(in_jail.c_str()) < 0) die_child("chdir workdir");
             }
+
+            // The jail is built. Now enter our own user namespace for the
+            // defence-in-depth property -- a regained in-jail uid 0 becomes an
+            // unprivileged host id -- and block until the parent installs our
+            // uid/gid maps. The parent must do it: an unprivileged in-namespace
+            // self-map cannot produce the two-line map we need. Without the map
+            // the setresuid(sandbox_uid) in drop_privileges could not resolve.
+            if (unshare(CLONE_NEWUSER) < 0) die_child("unshare userns");
+            if (write(ready_pipe[1], "R", 1) != 1) _exit(126);
+            close(ready_pipe[1]);
+            char m = 0;
+            if (read(done_pipe[0], &m, 1) != 1 || m != 'M') _exit(126);
+            close(done_pipe[0]);
 
             drop_privileges(sandbox_uid, sandbox_gid);
             apply_rlimits(timeout_sec);
@@ -963,6 +1146,14 @@ int main(int argc, char* argv[]) {
             die_child("execve");
         }
 
+        // Back in the middle child: the leaf's userns pipes belong to the leaf
+        // now; hand the parent the leaf's pid so it can write the leaf's maps.
+        close(ready_pipe[1]);
+        close(done_pipe[0]);
+        if (write(pid_pipe[1], &leaf, sizeof(leaf)) != (ssize_t)sizeof(leaf))
+            _exit(126);
+        close(pid_pipe[1]);
+
         int status = 0;
         if (waitpid(leaf, &status, 0) < 0) _exit(126);
         if (WIFEXITED(status))  _exit(WEXITSTATUS(status));
@@ -971,7 +1162,10 @@ int main(int argc, char* argv[]) {
     }
 
     // ---------------- parent ----------------
-    close(sync_pipe[0]);
+    close(sync_pipe[0]);     // middle child reads it
+    close(pid_pipe[1]);      // middle child writes it
+    close(ready_pipe[1]);    // leaf writes it
+    close(done_pipe[0]);     // leaf reads it
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
@@ -982,8 +1176,31 @@ int main(int argc, char* argv[]) {
     // Pre-open cgroup.kill so the signal handler does no allocation.
     g_kill_fd = open((cgroup_path + "/cgroup.kill").c_str(), O_WRONLY | O_CLOEXEC);
 
+    // Release the middle child, which then unshares and forks the leaf.
     if (write(sync_pipe[1], "G", 1) != 1) die("sync write");
     close(sync_pipe[1]);
+
+    // Learn the leaf's pid, wait for it to create its user namespace, then write
+    // its uid/gid maps from here -- the parent is real root in the initial user
+    // namespace and so holds the CAP_SETUID/CAP_SETGID needed to map ids other
+    // than its own. The leaf's own mount view has been pivoted away by now, but
+    // the parent still sees it through the host /proc. EOF at either step means
+    // the child died first, so fail closed.
+    pid_t leaf_pid = -1;
+    if (read(pid_pipe[0], &leaf_pid, sizeof(leaf_pid)) != (ssize_t)sizeof(leaf_pid)
+        || leaf_pid <= 0)
+        die("read leaf pid");
+    close(pid_pipe[0]);
+
+    char r = 0;
+    if (read(ready_pipe[0], &r, 1) != 1 || r != 'R') die("userns handshake");
+    close(ready_pipe[0]);
+
+    if (!write_userns_maps(leaf_pid, sandbox_uid, sandbox_gid))
+        die("write userns uid/gid maps");
+
+    if (write(done_pipe[1], "M", 1) != 1) die("maps-done write");
+    close(done_pipe[1]);
 
     // No SA_RESTART: we want poll() to return EINTR so the timeout is noticed
     // even if writing cgroup.kill fails.

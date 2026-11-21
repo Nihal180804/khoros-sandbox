@@ -12,8 +12,14 @@
 set -uo pipefail
 
 URL="${KHOROS_URL:-http://127.0.0.1:8000}"
+ROOTFS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/rootfs"
 PASS=0
 FAIL=0
+
+# A runtime is only testable if its interpreter/compiler is in the rootfs. The
+# gateway advertises every language regardless, so guard the new-runtime cases
+# here rather than letting them fail as SANDBOX_ERROR on a minimal rootfs.
+has_rt() { [ -x "${ROOTFS}/usr/bin/$1" ]; }
 
 check() {
     local name="$1"; shift
@@ -99,6 +105,57 @@ check "/dev/null and /dev/urandom exist" \
 check "rejects out-of-range timeout" \
     '{"language":"python","code":"print(1)","timeout_sec":9999}' \
     'r.get("verdict") != "OK"'
+
+# ---------------- additional runtimes (skipped if not in the rootfs) ----------
+if has_rt node; then
+    check "node execution" \
+        '{"language":"node","code":"console.log(6*7)"}' \
+        'r["verdict"] == "OK" and "42" in r["stdout"]'
+else
+    echo "[skip] node execution (no /usr/bin/node in rootfs)"
+fi
+
+if has_rt rustc; then
+    check "rust compile and run" \
+        '{"language":"rust","code":"fn main(){ println!(\"rust {}\", 2+2); }"}' \
+        'r["verdict"] == "OK" and "rust 4" in r["stdout"]'
+    check "rust compile error -> COMPILATION_ERROR" \
+        '{"language":"rust","code":"fn main(){ let x: i32 = \"nope\"; }"}' \
+        'r["verdict"] == "COMPILATION_ERROR"'
+else
+    echo "[skip] rust (no /usr/bin/rustc in rootfs)"
+fi
+
+if has_rt go; then
+    check "go compile and run" \
+        '{"language":"go","code":"package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"go\", 3*3) }"}' \
+        'r["verdict"] == "OK" and "go 9" in r["stdout"]'
+else
+    echo "[skip] go (no /usr/bin/go in rootfs)"
+fi
+
+# ---------------- per-run uid pool: concurrent runs get distinct ids ----------
+echo "[....] per-run uid isolation (two concurrent requests)"
+UID_BODY='{"language":"python","code":"import os,time; time.sleep(0.4); print(os.getuid())","timeout_sec":5}'
+TMPA="$(mktemp)"; TMPB="$(mktemp)"
+curl -sS -X POST "${URL}/execute" -H 'Content-Type: application/json' \
+    ${KHOROS_API_KEY:+-H "X-API-Key: ${KHOROS_API_KEY}"} -d "${UID_BODY}" >"${TMPA}" &
+curl -sS -X POST "${URL}/execute" -H 'Content-Type: application/json' \
+    ${KHOROS_API_KEY:+-H "X-API-Key: ${KHOROS_API_KEY}"} -d "${UID_BODY}" >"${TMPB}" &
+wait
+if python3 -c "
+import json,sys
+a=json.load(open('${TMPA}')); b=json.load(open('${TMPB}'))
+ua=(a.get('stdout') or '').strip(); ub=(b.get('stdout') or '').strip()
+ok = ua.isdigit() and ub.isdigit() and ua != ub
+print('   uids:', ua, ub)
+sys.exit(0 if ok else 1)
+"; then
+    echo "[PASS] per-run uid isolation"; PASS=$((PASS+1))
+else
+    echo "[FAIL] per-run uid isolation (expected two different uids)"; FAIL=$((FAIL+1))
+fi
+rm -f "${TMPA}" "${TMPB}"
 
 echo
 echo "=== ${PASS} passed, ${FAIL} failed ==="

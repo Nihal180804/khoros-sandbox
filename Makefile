@@ -42,13 +42,12 @@ escape-tests:
 	chmod +x scripts/escape_tests.sh
 	./scripts/escape_tests.sh
 
+# p50/p95/p99 over BENCH_RUNS runs, warm-cache, against whatever of
+# bwrap/docker/nsjail/isolate is installed. In-engine vs end-to-end latency are
+# reported separately. Pass extra flags via BENCH_ARGS, e.g.
+#   make bench BENCH_ARGS="--runs 2000 --engines khoros,bwrap --json bench.json"
 bench:
-	@echo "Not written yet. A credible bench needs: p50/p95/p99 over >=1000 runs,"
-	@echo "kernel + CPU recorded, warm vs cold distinguished, and the same"
-	@echo "workload run against nsjail / bubblewrap / isolate / Docker."
-	@echo "Note that wall_time_ms is measured inside the runner and excludes the"
-	@echo "sudo exec and HTTP handling, so report end-to-end latency separately."
-	@false
+	python3 scripts/bench.py $(BENCH_ARGS)
 
 # Record the syscalls a workload actually makes, to refine the seccomp
 # allowlist. Run the jail with --seccomp log and read the denials from dmesg.

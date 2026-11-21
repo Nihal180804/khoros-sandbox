@@ -84,10 +84,14 @@ fi
 # --------------------------------------------------------------------------
 # Runtimes
 # --------------------------------------------------------------------------
-say "Installing Python 3, GCC/G++, musl-dev into the rootfs"
+# Python 3, the C/C++ toolchain, plus the Node, Go and Rust runtimes.
+# NOTE: go and rust pull in large toolchains; this grows the rootfs by a few
+# hundred MB. Drop them from the apk line if you only need Python/C++/Node.
+say "Installing Python 3, GCC/G++, musl-dev, Node.js, Go and Rust into the rootfs"
 sudo cp /etc/resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 sudo chroot "${ROOTFS_DIR}" /sbin/apk update
-sudo chroot "${ROOTFS_DIR}" /sbin/apk add --no-cache python3 gcc g++ musl-dev
+sudo chroot "${ROOTFS_DIR}" /sbin/apk add --no-cache \
+    python3 gcc g++ musl-dev nodejs npm go rust cargo
 sudo rm -f "${ROOTFS_DIR}/etc/resolv.conf"
 
 # apk is not needed at execution time and only widens the attack surface.
@@ -130,7 +134,9 @@ case "${PERMS}" in
     *[2367]) die "rootfs must not be group/world writable (mode ${PERMS})" ;;
 esac
 
-for p in /usr/bin/python3 /usr/bin/g++; do
+# These absolute paths are what api/server.py execs inside the jail, so a
+# mismatch here is caught now rather than as a per-request SANDBOX_ERROR.
+for p in /usr/bin/python3 /usr/bin/g++ /usr/bin/node /usr/bin/go /usr/bin/rustc; do
     [ -x "${ROOTFS_DIR}${p}" ] || die "missing ${p} inside the rootfs"
 done
 

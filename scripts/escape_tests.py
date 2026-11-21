@@ -5,6 +5,13 @@ Every case here corresponds to a specific escape or resource-exhaustion path.
 A green run is the evidence behind the word "hardened" in the README; without
 it that word is a claim rather than a result.
 
+These cases target the default bind-mount workspace. One case, "rootfs is
+read-only", asserts that a write to /usr fails outright; under the opt-in
+overlay workspace (KHOROS_OVERLAY=1) that write instead succeeds into the
+per-run upper layer and is discarded at teardown -- still no persistence to the
+shared rootfs, but a different mechanism. Run this suite with overlay off (the
+default) to validate the property as stated.
+
 Usage:
     python3 scripts/escape_tests.py [--url http://127.0.0.1:8000] [-v]
 """
@@ -72,6 +79,27 @@ CASES: list[Case] = [
         "a retained setuid capability would undo the whole privilege drop",
         'import os\ntry:\n os.setuid(0); print("ESCAPED")\nexcept Exception as e: print("blocked", type(e).__name__)',
         lambda r: "ESCAPED" not in out(r),
+    ),
+    Case(
+        "runs inside a user namespace",
+        "in the initial userns a regained uid 0 is real host root; the jail must "
+        "run in its own userns whose inside-uid 0 maps to an unprivileged host id",
+        'import os\n'
+        'm = {}\n'
+        'for line in open("/proc/self/uid_map"):\n'
+        '    inside, host, length = (int(x) for x in line.split())\n'
+        '    m[inside] = host\n'
+        'uid = os.getuid()\n'
+        'print("UID=%d" % uid)\n'
+        'print("INSIDE0_HOST=%s" % m.get(0))\n'            # None if unmapped
+        'print("IDENTITY=%s" % (m.get(uid) == uid))',      # our uid maps 1:1
+        # The map must NOT be an initial-namespace identity map: inside-uid 0 may
+        # not map to host 0, and our own (nonzero) uid must be present and
+        # identity-mapped so the host sees workspace writes as that pool id.
+        lambda r: "INSIDE0_HOST=0" not in out(r)
+                  and "INSIDE0_HOST=None" not in out(r)
+                  and "IDENTITY=True" in out(r)
+                  and "UID=0\n" not in (out(r) + "\n"),
     ),
 
     # ---------------- host takeover paths ----------------
@@ -174,6 +202,16 @@ CASES: list[Case] = [
         "visibility of host pids enables targeted signalling and recon",
         'import os; pids=[p for p in os.listdir("/proc") if p.isdigit()]; print("npids", len(pids))',
         lambda r: any(f"npids {n}" in out(r) for n in range(1, 8)),
+    ),
+    Case(
+        "/dev nodes are present and usable",
+        "the jailed program needs /dev/null, /dev/zero and /dev/urandom; the "
+        "device nodes are created as real root before the user namespace exists",
+        'open("/dev/null", "w").write("x")\n'
+        'open("/dev/zero", "rb").read(4)\n'
+        'n = len(open("/dev/urandom", "rb").read(16))\n'
+        'print("dev_ok", n)',
+        lambda r: r.get("verdict") == "OK" and "dev_ok 16" in out(r),
     ),
 
     # ---------------- network ----------------
